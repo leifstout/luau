@@ -156,6 +156,82 @@ static std::optional<TypeId> findExpectedTypeAt(const Module& module, AstNode* n
     return *it;
 }
 
+static std::optional<TypeId> getFirstParamTypeOfFunctionLike(TypeId ty)
+{
+    ty = follow(ty);
+
+    if (const FunctionType* ftv = get<FunctionType>(ty))
+    {
+        auto [head, tail] = flatten(ftv->argTypes);
+        if (!head.empty())
+            return head[0];
+        return std::nullopt;
+    }
+
+    if (const IntersectionType* itv = get<IntersectionType>(ty))
+    {
+        for (TypeId part : itv->parts)
+        {
+            part = follow(part);
+            if (const FunctionType* ftv = get<FunctionType>(part))
+            {
+                auto [head, tail] = flatten(ftv->argTypes);
+                if (!head.empty())
+                    return head[0];
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+static std::optional<TypeId> inferTableExpectedTypeFromFirstArgument(
+    const Module& module,
+    AstExprTable* exprTable,
+    const std::vector<AstNode*>& ancestry)
+{
+    const AstExprCall* exprCall = nullptr;
+
+    // Find the call that directly owns this table
+    for (size_t i = ancestry.size(); i-- > 0;)
+    {
+        if (ancestry[i] == exprTable)
+        {
+            if (i > 0)
+                exprCall = ancestry[i - 1]->as<AstExprCall>();
+            break;
+        }
+    }
+
+    if (!exprCall)
+        return std::nullopt;
+
+    // Locate this table within call->args
+    size_t argIndex = exprCall->args.size;
+    for (size_t i = 0; i < exprCall->args.size; ++i)
+    {
+        if (exprCall->args.data[i] == exprTable)
+        {
+            argIndex = i;
+            break;
+        }
+    }
+
+    // React style: e(componentFn, propsTable)
+    if (argIndex != 1 || exprCall->args.size < 2)
+        return std::nullopt;
+
+    AstExpr* firstArg = exprCall->args.data[0];
+
+    auto it = module.astTypes.find(firstArg);
+    if (!it)
+        return std::nullopt;
+
+    std::string tyStr = toString(*it);
+
+    return getFirstParamTypeOfFunctionLike(*it);
+}
+
 static bool checkTypeMatch(
     const Module& module,
     TypeId subTy,
@@ -2096,64 +2172,94 @@ AutocompleteResult autocomplete_(
     else if (AstExprTable* exprTable = parent->as<AstExprTable>();
              exprTable && (node->is<AstExprGlobal>() || node->is<AstExprConstantString>() || node->is<AstExprInterpString>()))
     {
+        // node is the key (or value acting as key) inside the table
         for (const auto& [kind, key, value] : exprTable->items)
         {
             // If item doesn't have a key, maybe the value is actually the key
             if (key ? key == node : node->is<AstExprGlobal>() && value == node)
             {
+                AutocompleteEntryMap result;
+                std::optional<TypeId> expectedType;
+
                 if (auto it = module->astExpectedTypes.find(exprTable))
                 {
-                    auto result = autocompleteProps(*module, typeArena, builtinTypes, *it, PropIndexType::Key, ancestry);
+                    expectedType = *it;
 
-                    if (auto nodeIt = module->astExpectedTypes.find(node->asExpr()))
-                        autocompleteStringSingleton(*nodeIt, !node->is<AstExprConstantString>(), node, position, result);
+                    std::string tyStr = toString(*expectedType);
 
-                    if (!key)
+                    result = autocompleteProps(*module, typeArena, builtinTypes, *expectedType,
+                                            PropIndexType::Key, ancestry);
+                }
+
+                if (result.empty())
+                {
+                    if (auto inferred = inferTableExpectedTypeFromFirstArgument(*module, exprTable, ancestry))
                     {
-                        // If there is "no key," it may be that the user
-                        // intends for the current token to be the key, but
-                        // has yet to type the `=` sign.
-                        //
-                        // If the key type is a union of singleton strings,
-                        // suggest those too.
-                        if (auto ttv = get<TableType>(follow(*it)); ttv && ttv->indexer)
-                        {
-                            autocompleteStringSingleton(ttv->indexer->indexType, false, node, position, result);
-                        }
+                        expectedType = inferred;
+
+                        std::string tyStr = toString(*expectedType);
+
+                        result = autocompleteProps(*module, typeArena, builtinTypes, *expectedType,
+                                                PropIndexType::Key, ancestry);
                     }
+                }
+
+                if (expectedType && !result.empty())
+                {
+                    // If we're typing the key as a string/global, also offer string singletons
+                    if (auto ttv = get<TableType>(follow(*expectedType)); ttv && ttv->indexer)
+                        autocompleteStringSingleton(ttv->indexer->indexType,
+                                                    !node->is<AstExprConstantString>(),
+                                                    node, position, result);
 
                     // Remove keys that are already completed
-                    for (const auto& item : exprTable->items)
+                    for (const auto& otherItem : exprTable->items)
                     {
-                        if (!item.key)
+                        if (!otherItem.key)
                             continue;
 
-                        if (auto stringKey = item.key->as<AstExprConstantString>())
+                        if (auto stringKey = otherItem.key->as<AstExprConstantString>())
                             result.erase(std::string(stringKey->value.data, stringKey->value.size));
                     }
-
-                    // If we know for sure that a key is being written, do not offer general expression suggestions
-                    if (!key)
-                        autocompleteExpression(*module, builtinTypes, typeArena, ancestry, scopeAtPosition, position, result);
 
                     return {std::move(result), ancestry, AutocompleteContext::Property};
                 }
 
-                break;
+                AutocompleteEntryMap fallback;
+                autocompleteExpression(*module, builtinTypes, typeArena, ancestry, scopeAtPosition, position, fallback);
+                return {std::move(fallback), ancestry, AutocompleteContext::Property};
             }
         }
     }
     else if (AstExprTable* exprTable = node->as<AstExprTable>())
     {
         AutocompleteEntryMap result;
+        std::optional<TypeId> expectedType;
 
         if (auto it = module->astExpectedTypes.find(exprTable))
         {
-            result = autocompleteProps(*module, typeArena, builtinTypes, *it, PropIndexType::Key, ancestry);
+            expectedType = *it;
 
-            // If the key type is a union of singleton strings,
-            // suggest those too.
-            if (auto ttv = get<TableType>(follow(*it)); ttv && ttv->indexer)
+            std::string tyStr = toString(*expectedType);
+
+            result = autocompleteProps(*module, typeArena, builtinTypes, *expectedType, PropIndexType::Key, ancestry);
+        }
+
+        if (result.empty())
+        {
+            if (auto inferred = inferTableExpectedTypeFromFirstArgument(*module, exprTable, ancestry))
+            {
+                expectedType = inferred;
+
+                std::string tyStr = toString(*expectedType);
+
+                result = autocompleteProps(*module, typeArena, builtinTypes, *expectedType, PropIndexType::Key, ancestry);
+            }
+        }
+
+        if (expectedType && !result.empty())
+        {
+            if (auto ttv = get<TableType>(follow(*expectedType)); ttv && ttv->indexer)
             {
                 autocompleteStringSingleton(ttv->indexer->indexType, false, node, position, result);
             }
@@ -2167,9 +2273,10 @@ AutocompleteResult autocomplete_(
                 if (auto stringKey = item.key->as<AstExprConstantString>())
                     result.erase(std::string(stringKey->value.data, stringKey->value.size));
             }
+
+            return {std::move(result), ancestry, AutocompleteContext::Property};
         }
 
-        // Also offer general expression suggestions
         autocompleteExpression(*module, builtinTypes, typeArena, ancestry, scopeAtPosition, position, result);
 
         return {std::move(result), ancestry, AutocompleteContext::Property};
